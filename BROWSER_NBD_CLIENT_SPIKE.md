@@ -66,6 +66,131 @@ The browser uses XO's existing HTTP/WebSocket endpoint. Hosts connect outbound t
 
 `XO_BROWSER_MEDIA_NBD_ALLOW_PLAINTEXT=1` disables the native TLS requirement only for explicit lab experiments. `XO_BROWSER_MEDIA_ALLOW_HTTP=1` is a separate switch for the browser HTTP origin. The successful native host test used verified TLS even though the isolated browser fixture used HTTP.
 
+## How to install and try it
+
+These steps target the tested XCP-ng 8.3 host layout and an existing working XO source installation. Use the `feat/browser-nbd-client` branches in the forks. The example assumes XO runs on `192.168.1.30`, its web UI is already configured on port `8080`, and the test host is `192.168.1.71`. Replace those addresses and ports for your environment. The native NBD connection uses verified TLS even when the browser uses HTTP on this trusted lab network.
+
+### 1. Build the XO fork
+
+Use a separate checkout so the existing XO checkout stays available. The builds were verified with Node.js 22.23.0 and Yarn Classic 1.22.22. Retain the usual XO runtime dependencies and configuration, including Redis; these commands build the experimental application, not a complete fresh XO appliance.
+
+```sh
+git clone --branch feat/browser-nbd-client --single-branch https://github.com/olivierlambert/xen-orchestra-fork.git xo-browser-nbd
+cd xo-browser-nbd
+yarn install --frozen-lockfile
+TURBO_TELEMETRY_DISABLED=1 yarn turbo run build --filter xo-server --filter xo-web --filter @xen-orchestra/web
+```
+
+Make sure your XO configuration serves the assets from this checkout. Building a new checkout while the service still starts the old one will not enable the feature. For example, adjust the existing `[http.mounts]` section in your XO configuration to the actual absolute paths, without adding a duplicate section:
+
+```toml
+[http.mounts]
+'/v5' = '/absolute/path/to/xo-browser-nbd/packages/xo-web/dist/'
+'/v6' = '/absolute/path/to/xo-browser-nbd/@xen-orchestra/web/dist/'
+```
+
+Keep the existing working HTTP listener, reverse proxy, authentication, and other settings. If using a reverse proxy, it must forward WebSocket upgrades for `/api/browser-media/`. The separate NBD port needs TCP access from the hosts; an ordinary HTTP proxy route is insufficient.
+
+### 2. Prepare a certificate for the native NBD listener
+
+A certificate already trusted by Dom0 and matching the XO destination hostname is preferable. For this IP-based lab, generate a dedicated temporary certificate on the XO machine. Run these commands as the account that will run xo-server, from the new checkout:
+
+```sh
+mkdir -p "$HOME/.config/xo-browser-nbd-tls"
+chmod 700 "$HOME/.config/xo-browser-nbd-tls"
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+  -keyout "$HOME/.config/xo-browser-nbd-tls/key.pem" \
+  -out "$HOME/.config/xo-browser-nbd-tls/cert.pem" \
+  -subj '/CN=192.168.1.30' \
+  -addext 'subjectAltName=IP:192.168.1.30'
+chmod 600 "$HOME/.config/xo-browser-nbd-tls/key.pem"
+```
+
+The subject alternative name must match the hostname or IP in `XO_BROWSER_MEDIA_ORIGIN`. For a DNS name, use `DNS:xo.example` instead of the IP alternative name. Copy only the certificate to the hosts; the private key stays on XO. This lab certificate expires after 30 days.
+
+### 3. Install the SM driver on XCP-ng
+
+From another directory on your workstation, obtain the SM fork. There is no need to build or replace the whole SM package:
+
+```sh
+git clone --branch feat/browser-nbd-client --single-branch https://github.com/olivierlambert/sm.git sm-browser-nbd
+ssh root@192.168.1.71 'mkdir -p /root/browser-nbd-client'
+scp sm-browser-nbd/drivers/BrowserNbdSR.py \
+  sm-browser-nbd/scripts/prototypes/install-browser-nbd-client.py \
+  root@192.168.1.71:/root/browser-nbd-client/
+```
+
+From the XO checkout, copy the public certificate:
+
+```sh
+scp "$HOME/.config/xo-browser-nbd-tls/cert.pem" root@192.168.1.71:/root/browser-nbd-client/ca.pem
+```
+
+On the XCP-ng host, check that the existing components are present and install the driver:
+
+```sh
+rpm -q nbd
+command -v nbd-client
+ls /opt/xensource/libexec/nbd_client_manager.py
+modinfo nbd
+python3 /root/browser-nbd-client/install-browser-nbd-client.py /root/browser-nbd-client/BrowserNbdSR.py
+```
+
+The tested host already supplied these components. If a prerequisite is missing, stop here and check the host version and its supported packages; this spike does not require a custom NBD build. The installer backs up replaced files under `/root/browser-nbd-client-backup`, installs the driver and launcher, and registers `browsernbd` in `/etc/xapi.conf`. Do not run the earlier `install-browser-media.py` installer for this path: its nbdkit/WebSocket bridge and core SM patches are unnecessary here.
+
+For the first registration, restart XAPI during an appropriate maintenance window. This temporarily interrupts management/API access; running VMs normally continue running. Wait for the API to return before checking discovery:
+
+```sh
+systemctl restart xapi
+xe sm-list type=browsernbd params=uuid,type,name-label
+```
+
+If `xe` initially reports connection refused, wait and repeat the discovery command. Subsequent changes to the driver source normally load on the next SM invocation without another registration restart. Install the driver and certificate at the same paths on every host in a pool that will use the shared media. The prototype was validated on a single-host pool.
+
+### 4. Start the modified XO server
+
+Allow connections from the XCP-ng hosts to TCP port `10809` on the XO machine. Use your existing firewall policy and keep that port separate from the browser's `8080` web port. From the root of the new XO checkout, this is a complete environment example for the trusted HTTP lab:
+
+```sh
+export XO_BROWSER_MEDIA_ORIGIN=http://192.168.1.30:8080
+export XO_BROWSER_MEDIA_ALLOW_HTTP=1
+export XO_BROWSER_MEDIA_TRANSPORT=nbd-client
+export XO_BROWSER_MEDIA_NBD_BIND=0.0.0.0
+export XO_BROWSER_MEDIA_NBD_PORT=10809
+export XO_BROWSER_MEDIA_NBD_TLS_KEY="$HOME/.config/xo-browser-nbd-tls/key.pem"
+export XO_BROWSER_MEDIA_NBD_TLS_CERT="$HOME/.config/xo-browser-nbd-tls/cert.pem"
+export XO_BROWSER_MEDIA_NBD_CA_FILE=/root/browser-nbd-client/ca.pem
+unset XO_BROWSER_MEDIA_NBD_ALLOW_PLAINTEXT
+yarn workspace xo-server start
+```
+
+Stop the previous XO process using the same ports before starting this one. Use the existing XO configuration and data deliberately; do not start a second instance against the same configuration accidentally. If XO runs under systemd, put the same environment values in its service configuration using absolute file paths, point its working directory/start command at this checkout, and restart the service. Exporting variables in your terminal does not change an already running service.
+
+For HTTPS, set `XO_BROWSER_MEDIA_ORIGIN=https://xo.example` to the actual origin and omit `XO_BROWSER_MEDIA_ALLOW_HTTP`. The native certificate must still match `xo.example`. `XO_BROWSER_MEDIA_NBD_CA_FILE` is a path on the XCP-ng hosts, not a file that xo-server reads; omit it when the native listener certificate is already trusted by their system CA bundle.
+
+The browser and xo-server can run on different machines. The ISO stays on the browser machine. The hosts connect to xo-server's reachable address, so use the XO server's address in the origin, not the browser computer's address unless they are the same machine.
+
+### 5. Mount and verify a local ISO
+
+Sign in as an XO administrator and refresh the UI after the server restart. In XO 6, open **VM → Console** and use the local-ISO panel. In XO 5, open the VM's **Disks** tab and use **Connect local ISO (experimental)** below the usual CD dropdown. Select a local ISO and keep that browser tab open.
+
+You can insert the ISO while the VM is halted, then boot it with CD first in the boot order. A running HVM VM needs an existing, attached CD drive; if it has none, shut it down once so the drive can be created. BIOS and UEFI both worked in the spike. XO creates the temporary shared SR, VDI, and pool PBDs automatically; do not manually create a local ISO SR or upload the file to a share.
+
+To inspect the active backend on the host:
+
+```sh
+tap-ctl list
+xe sr-list type=browsernbd params=uuid,name-label,shared
+```
+
+Expect the test ISO's tapdisk to use an `aio:/dev/nbdN` path. Closing the source tab or using Disconnect ends the session; the guest can no longer depend on that CD. Cached installer data may allow the guest to continue temporarily, so a still-visible installer screen does not prove the media remains connected.
+
+If the UI is missing, check the running server checkout, asset mounts, administrator account, environment, and browser refresh. If insertion or boot fails, check `browsernbd` discovery, host-to-XO TCP reachability, the certificate name/trust file, and `/var/log/SMlog`. Do not include export capabilities or unredacted connection command lines in shared logs.
+
+### 6. Stop using the prototype
+
+Disconnect active browser media in XO before stopping the experimental server. Remove the `XO_BROWSER_MEDIA_*` settings and restart the previous XO build/configuration to return to the prior setup. The host driver can remain installed but unused. If removing it, first ensure no `browsernbd` VDIs/SRs remain in use, then remove its plugin registration and driver files and restart XAPI for discovery. Do not blindly restore an old entire `xapi.conf`, because it may contain unrelated changes made since installation.
+
 ## Tradeoffs and remaining work
 
 The host code is smaller and follows normal SM activation, but the data path gains a kernel NBD layer. TLS is handled by the stock client process; this is not a zero-copy or measured performance result. Throughput, CPU cost, concurrent boot storms, and failure latency remain unmeasured.
