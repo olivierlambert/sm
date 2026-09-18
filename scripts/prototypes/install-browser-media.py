@@ -13,8 +13,10 @@ import sys
 root = Path('/opt/xensource/sm')
 backup = Path('/root/browser-media-prototype/backup')
 nbdkit = '/opt/browser-media-prototype/nbdkit/sbin/nbdkit'
-if os.geteuid() != 0 or not os.path.isfile(nbdkit):
-    raise SystemExit('Run as root after installing the isolated nbdkit build')
+if os.geteuid() != 0:
+    raise SystemExit('Run as root')
+if not os.path.isfile(nbdkit) and not Path(sys.argv[1]).with_name('browser_nbd_ws.py').exists():
+    raise SystemExit('Provide the WebSocket bridge or install nbdkit for HTTP mode')
 
 source = Path(sys.argv[1]).read_text()
 imports = 'from sm import SR, VDI, blktap2\nfrom sm.core import util\nfrom sm.core.lock import Lock'
@@ -70,6 +72,9 @@ if old_types in tap_source:
 elif new_types not in tap_source:
     raise SystemExit('Unrecognized tapdisk type table; refusing installation')
 
+bridge = Path(sys.argv[1]).with_name('browser_nbd_ws.py')
+if bridge.exists():
+    install(root / bridge.name, bridge.read_text(), 0o644)
 install(root / 'BrowserISOSR.py', source, 0o644)
 install(root / 'BrowserISOSR', '''#!/usr/bin/python3
 import SRCommand

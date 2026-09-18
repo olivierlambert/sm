@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: LGPL-2.1-only
 """Experimental ephemeral ISO media served by an XO browser session.
 
-A systemd-supervised nbdkit process owns each attached VDI's Unix socket.
+A systemd-supervised WebSocket bridge (or nbdkit for HTTP) owns the Unix socket.
 No ISO bytes are persisted. Device configuration contains a short-lived bearer
 URL: treat it as a secret and do not log it.
 """
+import json
 import os
 import socket
 import shutil
@@ -32,11 +33,16 @@ DRIVER_INFO = {
     'configuration': [['url', 'HTTPS media capability URL'], ['size', 'ISO size in bytes']],
 }
 RUNTIME = '/run/sm-browseriso'
+WS_BRIDGE = os.path.join(os.path.dirname(__file__), 'browser_nbd_ws.py')
 
 
 def validate_config(config):
     url = urlsplit(config.get('url', ''))
-    schemes = ('https', 'http') if config.get('allow_http') == 'true' else ('https',)
+    transport = config.get('transport', 'http')
+    if transport not in ('http', 'nbd-ws'):
+        raise util.SMException('Unknown browser media transport')
+    secure, insecure = ('wss', 'ws') if transport == 'nbd-ws' else ('https', 'http')
+    schemes = (secure, insecure) if config.get('allow_http') == 'true' else (secure,)
     if (url.scheme not in schemes or not url.hostname or url.username or
             url.password or url.fragment or url.query or
             not url.path.startswith('/api/browser-media/')):
@@ -55,6 +61,10 @@ class NoRedirect(HTTPRedirectHandler):
 def check_source(config):
     """PBD plug validates that this host can read the same medium as its peers."""
     try:
+        if config.get('transport') == 'nbd-ws':
+            from browser_nbd_ws import probe
+            probe(config['url'], validate_config(config))
+            return
         request = Request(config['url'], method='HEAD')
         with build_opener(NoRedirect).open(request, timeout=10) as response:
             if (response.status != 200 or
@@ -83,6 +93,9 @@ class BrowserISOSR(SR.SR):
         self.attach(sr_uuid)
 
     def attach(self, sr_uuid):
+        if self.dconf.get('transport') == 'nbd-ws':
+            check_source(self.dconf)
+            return
         if shutil.which('nbdkit') is None:
             raise util.SMException('Install nbdkit and its curl plugin on this host')
         result = subprocess.run([shutil.which('nbdkit'), 'curl', '--dump-plugin'],
@@ -124,6 +137,7 @@ class BrowserISOVDI(VDI.VDI):
         self.sm_config = {}
         self.socket_path = os.path.join(RUNTIME, self.uuid + '.sock')
         self.unit = 'sm-browseriso-' + self.uuid + '.service'
+        self.config_path = os.path.join(RUNTIME, self.uuid + '.json')
 
     def create(self, sr_uuid, vdi_uuid, size):
         if size != self.size or not self.read_only:
@@ -153,8 +167,7 @@ class BrowserISOVDI(VDI.VDI):
             self.detach(sr_uuid, vdi_uuid)
             # No shell interpolation. The URL is a capability; avoid logging this
             # argv or subprocess output. systemd owns process lifetime, not SM.
-            result = subprocess.run([
-                '/usr/bin/systemd-run', '--quiet', '--unit=' + self.unit,
+            command = [
                 shutil.which('nbdkit') or '/usr/bin/nbdkit', '-f', '-r', '-U', self.socket_path,
                 # Tapdisk's NBD client uses the old-style handshake reliably;
                 # QEMU connects to tapdisk's own new-style NBD endpoint.
@@ -162,7 +175,13 @@ class BrowserISOVDI(VDI.VDI):
                 'url=' + self.sr.dconf['url'],
                 'protocols=' + urlsplit(self.sr.dconf['url']).scheme,
                 'followlocation=false', 'timeout=35',
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ]
+            if self.sr.dconf.get('transport') == 'nbd-ws':
+                with open(os.open(self.config_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as config_file:
+                    json.dump({'url': self.sr.dconf['url'], 'size': self.size}, config_file)
+                command = ['/usr/bin/python3', WS_BRIDGE, 'serve', self.config_path, self.socket_path]
+            result = subprocess.run(['/usr/bin/systemd-run', '--quiet', '--unit=' + self.unit] + command,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode:
                 raise util.SMException('Could not start browser ISO adapter')
             for _ in range(100):
@@ -208,10 +227,11 @@ class BrowserISOVDI(VDI.VDI):
                            stderr=subprocess.DEVNULL, timeout=5)
         subprocess.run(['/usr/bin/systemctl', 'reset-failed', self.unit],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+        for path in (self.socket_path, self.config_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 SR.registerSR(BrowserISOSR)

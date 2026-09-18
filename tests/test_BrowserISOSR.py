@@ -43,6 +43,27 @@ class TestBrowserISO(unittest.TestCase):
             validate_config(config)
         self.assertEqual(validate_config(dict(config, allow_http='true')), 32768)
 
+    def test_nbd_transport_requires_secure_websocket_or_lab_opt_in(self):
+        config = dict(CONFIG, transport='nbd-ws', url='wss://xo/api/browser-media/token/nbd')
+        self.assertEqual(validate_config(config), 32768)
+        for url in ['https://xo/api/browser-media/token/nbd', 'ws://xo/api/browser-media/token/nbd']:
+            with self.assertRaises(util.SMException):
+                validate_config(dict(config, url=url))
+        self.assertEqual(validate_config(dict(config, url='ws://xo/api/browser-media/token/nbd', allow_http='true')), 32768)
+        with self.assertRaises(util.SMException):
+            validate_config(dict(CONFIG, transport='unknown'))
+
+    def test_nbd_source_uses_handshake_probe(self):
+        bridge = mock.Mock()
+        config = dict(CONFIG, transport='nbd-ws', url='wss://xo/api/browser-media/token/nbd')
+        with mock.patch.dict('sys.modules', browser_nbd_ws=bridge):
+            check_source(config)
+            bridge.probe.assert_called_once_with(config['url'], 32768)
+            bridge.probe.side_effect = ValueError('secret URL')
+            with self.assertRaisesRegex(util.SMException, 'endpoint unreachable') as error:
+                check_source(config)
+            self.assertNotIn('secret', str(error.exception))
+
     def test_no_writable_attach(self):
         with self.assertRaises(util.SMException):
             self.vdi().attach(UUID, UUID, True)
@@ -109,7 +130,7 @@ class TestBrowserISO(unittest.TestCase):
                                mock.Mock(), mock.Mock(), mock.Mock()]
             vdi.detach(UUID, UUID)
         self.assertIn('--signal=KILL', run.call_args_list[1][0][0])
-        unlink.assert_called_once_with(vdi.socket_path)
+        unlink.assert_has_calls([mock.call(vdi.socket_path), mock.call(vdi.config_path)])
 
     def test_dispatch_bypasses_tapdisk(self):
         command = SRCommand({})
