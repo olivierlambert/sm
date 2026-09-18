@@ -8,6 +8,7 @@ SM_DRIVERS += Dummy
 SM_DRIVERS += udev
 SM_DRIVERS += ISO
 SM_DRIVERS += BrowserISO
+SM_DRIVERS += BrowserNbd
 SM_DRIVERS += HBA
 SM_DRIVERS += Linstor
 SM_DRIVERS += LVM
