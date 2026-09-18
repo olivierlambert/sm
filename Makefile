@@ -8,7 +8,6 @@ SM_DRIVERS += Dummy
 SM_DRIVERS += udev
 SM_DRIVERS += ISO
 SM_DRIVERS += BrowserISO
-SM_LIBS += browser_nbd_ws
 SM_DRIVERS += HBA
 SM_DRIVERS += Linstor
 SM_DRIVERS += LVM
@@ -25,6 +24,7 @@ SM_DRIVERS += MooseFS
 SM_DRIVERS += LargeBlock
 
 SM_LIBS := SR
+SM_LIBS += browser_nbd_ws
 SM_LIBS += SRCommand
 SM_LIBS += VDI
 SM_LIBS += vditype
