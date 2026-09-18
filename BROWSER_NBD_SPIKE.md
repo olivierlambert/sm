@@ -108,10 +108,10 @@ return to the original spike after disconnecting existing sessions.
   EOF, write rejection, tab loss, and capability separation.
 - 113 targeted SM tests passed, including transport validation, NBD probing and
   the existing ISO/dispatcher/tapdisk coverage.
-- Changed JavaScript/TypeScript lint passed. xo-server, XO 5, and XO 6 production
-  bundling passed. The full XO 6 type-check remains blocked by errors outside
-  the changed media code (pool/traffic-rule types and missing test dependency
-  declarations in the reused dependency installation).
+- Changed JavaScript/TypeScript lint passed. A fresh dependency installation and
+  dependency-aware build completed all 16 tasks, including xo-server, XO 5 and
+  XO 6 production builds and the full XO 6 type-check. Initial failures caused
+  by reusing an older checkout's dependencies were resolved.
 - Real headless Chrome, a local ISO selected through its file input, the XO relay
   class, the host bridge, XAPI storage creation, tapdisk and the temporary guest
   were exercised together. The test harness used an isolated relay, not the
